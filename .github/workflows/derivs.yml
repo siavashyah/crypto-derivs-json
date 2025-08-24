@@ -23,13 +23,13 @@ jobs:
         run: |
           python scripts/build_derivs_json.py
           echo "Generated data/derivs.json"
-          ls -lah data
+          ls -lah data || true
 
       - name: Commit JSON (if changed)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/derivs.json
+          git add data/derivs.json || true
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
