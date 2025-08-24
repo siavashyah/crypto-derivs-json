@@ -1,6 +1,6 @@
 # scripts/build_derivs_json.py
 # Builds data/derivs.json with funding_z and oi_delta_z (Bybit, free endpoints) for BTC/ETH.
-# You can add more symbols to COINS later (e.g., {"id": "solana", "symbol": "SOLUSDT"}).
+# Safe-write: only replace existing JSON if we have at least min_items.
 
 import json
 import os
@@ -12,12 +12,12 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-LOOKBACK_DAYS = 90  # number of historical days for z-score context
-
+LOOKBACK_DAYS = 90
 COINS = [
     {"id": "bitcoin",  "symbol": "BTCUSDT"},
     {"id": "ethereum", "symbol": "ETHUSDT"},
 ]
+MIN_ITEMS_TO_REPLACE = 1  # require at least this many items to overwrite the file
 
 BYBIT_BASE = "https://api.bybit.com"
 
@@ -54,7 +54,7 @@ def z_score(series, latest):
 
 
 def get_bybit_funding_daily(symbol, days=LOOKBACK_DAYS):
-    # Funding history is 8-hourly; we average per day. Paginate to cover ~3 * days points.
+    # Funding history is 8-hourly; we average by day. Paginate to cover ~3 * days points.
     per_page = 200
     need_points = 3 * days + 6  # buffer
     cursor = None
@@ -93,11 +93,13 @@ def get_bybit_funding_daily(symbol, days=LOOKBACK_DAYS):
 
     days_sorted = sorted(per_day.keys())
     out = [{"date": d, "val": sum(per_day[d]) / len(per_day[d])} for d in days_sorted]
+    # Helpful logs
+    print(f"FUNDING {symbol}: points={len(got)} days={len(out)}")
     return out[-(days + 1):]  # include latest + history
 
 
 def get_bybit_oi_daily(symbol, days=LOOKBACK_DAYS):
-    # Daily open interest; Bybit v5 requires intervalTime=1d (not "interval").
+    # Daily open interest; Bybit v5 requires intervalTime=1d.
     per_page = 200
     cursor = None
     got = []
@@ -107,7 +109,7 @@ def get_bybit_oi_daily(symbol, days=LOOKBACK_DAYS):
         q = {
             "category": "linear",
             "symbol": symbol,
-            "intervalTime": "1d",  # <-- required param
+            "intervalTime": "1d",  # required param
             "limit": str(per_page)
         }
         if cursor:
@@ -123,7 +125,7 @@ def get_bybit_oi_daily(symbol, days=LOOKBACK_DAYS):
         if not cursor or not items:
             break
         attempts += 1
-        time.sleep(0.2)  # tiny backoff
+        time.sleep(0.2)
 
     arr = []
     for it in got:
@@ -134,12 +136,13 @@ def get_bybit_oi_daily(symbol, days=LOOKBACK_DAYS):
         except Exception:
             continue
 
-    arr.sort(key=lambda x: x["date"])  # ascending
-    return arr[-(days + 4):]  # a few extra days to compute 3D change
+    arr.sort(key=lambda x: x["date"])
+    print(f"OI {symbol}: rows={len(arr)}")
+    return arr[-(days + 4):]  # a few extra days for 3D change
 
 
 def compute_oi_3d_change(oi_series):
-    # Returns [{"date", "oi3"}], where oi3 is the 3-day percent change of OI
+    # Returns [{"date", "oi3"}], 3-day percent change
     out = []
     for i in range(len(oi_series)):
         d = oi_series[i]["date"]
@@ -163,9 +166,9 @@ def build_for_symbol(symbol):
 
     dates = sorted(set(fd.keys()).intersection(o3d.keys()))
     if len(dates) < 15:
+        print(f"SKIP {symbol}: insufficient aligned days ({len(dates)})")
         return None
 
-    # Use all but the latest day as the history for z-score
     funding_series = [fd[d] for d in dates[:-1]]
     funding_latest = fd[dates[-1]]
     funding_z = z_score(funding_series, funding_latest)
@@ -182,13 +185,29 @@ def build_for_symbol(symbol):
     }
 
 
+def write_json_atomic(path, data, min_items=1):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+    items_len = len(data.get("items", []))
+    if items_len >= min_items:
+        os.replace(tmp, path)
+        print(f"WROTE {path} (items={items_len})")
+    else:
+        print(f"SKIP overwrite: items={items_len} < min_items={min_items}. Keeping previous file.")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
 def main():
     items = []
     for c in COINS:
         try:
             res = build_for_symbol(c["symbol"])
             if res is None:
-                print(f"SKIP {c['symbol']}: not enough data")
                 continue
             items.append({"id": c["id"], **res})
             print(f"DONE {c['symbol']}: fz={res['funding_z']}, oiz={res['oi_delta_z']}")
@@ -202,10 +221,8 @@ def main():
         "items": items
     }
 
-    os.makedirs("data", exist_ok=True)
-    with open("data/derivs.json", "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
-    print("WROTE data/derivs.json")
+    # Only replace if at least MIN_ITEMS_TO_REPLACE results are present
+    write_json_atomic("data/derivs.json", out, min_items=MIN_ITEMS_TO_REPLACE)
 
 
 if __name__ == "__main__":
