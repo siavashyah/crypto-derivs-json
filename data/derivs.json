@@ -1,1 +1,9 @@
-
+{
+  "as_of": "2025-01-01T00:00:00Z",
+  "lookback_days": 90,
+  "source": "dummy",
+  "items": [
+    { "id": "bitcoin",  "funding_z": 0.10, "oi_delta_z": -0.20 },
+    { "id": "ethereum", "funding_z": -0.30, "oi_delta_z": 0.60 }
+  ]
+}
