@@ -1,6 +1,6 @@
 // api/derivs.js
-// Vercel Serverless function that returns funding_z and oi_delta_z for BTC/ETH.
-// Primary: Bybit (free). Fallback: OKX (free).
+// Returns funding_z and oi_delta_z for BTC/ETH (Bybit first, OKX fallback).
+// Designed to avoid empty `items` by computing each metric independently.
 
 export default async function handler(req, res) {
   try {
@@ -9,7 +9,7 @@ export default async function handler(req, res) {
     const COINS = [
       { id: 'bitcoin',  bybit: 'BTCUSDT',     okx: 'BTC-USDT-SWAP' },
       { id: 'ethereum', bybit: 'ETHUSDT',     okx: 'ETH-USDT-SWAP' }
-      // Add more: { id: 'solana', bybit: 'SOLUSDT', okx: 'SOL-USDT-SWAP' },
+      // Add more: { id: 'solana', bybit: 'SOLUSDT', okx: 'SOL-USDT-SWAP' }
     ];
 
     const BYBIT = 'https://api.bybit.com';
@@ -17,31 +17,28 @@ export default async function handler(req, res) {
 
     async function httpJSON(url) {
       const r = await fetch(url, {
-        headers: { 'user-agent': 'Mozilla/5.0', 'accept': 'application/json' }
+        headers: { 'user-agent': 'Mozilla/5.0', 'accept': 'application/json' },
+        cache: 'no-store'
       });
       if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + url);
       return r.json();
     }
 
     function toDateYMDms(ms) {
-      const ts = Number(ms);
-      return new Date(ts).toISOString().slice(0, 10); // YYYY-MM-DD
-    }
-    function toDateYMDsec(secEpoch) {
-      const ms = Number(secEpoch) * 1000;
-      return new Date(ms).toISOString().slice(0, 10);
+      const n = Number(ms);
+      return new Date(n).toISOString().slice(0, 10);
     }
 
     function zScore(series, latest) {
       const xs = series.filter(x => x !== null && !Number.isNaN(Number(x))).map(Number);
       if (xs.length < 10) return null;
-      const mean = xs.reduce((a,b)=>a+b,0) / xs.length;
-      const sd = Math.sqrt(xs.reduce((a,b)=>a+(b-mean)*(b-mean),0) / xs.length) || 0;
+      const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+      const sd = Math.sqrt(xs.reduce((a, b) => a + (b - mean) * (b - mean), 0) / xs.length) || 0;
       if (sd === 0) return 0;
       return (Number(latest) - mean) / sd;
     }
 
-    // Bybit: funding 8h → daily average
+    // ---------- Bybit providers ----------
     async function fundingDailyBybit(symbol) {
       const url = `${BYBIT}/v5/market/funding/history?category=linear&symbol=${symbol}&limit=200`;
       const data = await httpJSON(url);
@@ -54,11 +51,10 @@ export default async function handler(req, res) {
         perDay[d].push(r);
       });
       const days = Object.keys(perDay).sort();
-      const out = days.map(d => ({ date: d, val: perDay[d].reduce((a,b)=>a+b,0)/perDay[d].length }));
+      const out = days.map(d => ({ date: d, val: perDay[d].reduce((a, b) => a + b, 0) / perDay[d].length }));
       return out.slice(-(LOOKBACK_DAYS + 1));
     }
 
-    // Bybit: daily open interest
     async function oiDailyBybit(symbol) {
       const url = `${BYBIT}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1d&limit=200`;
       const data = await httpJSON(url);
@@ -67,30 +63,30 @@ export default async function handler(req, res) {
         date: toDateYMDms(it.timestamp),
         oi: Number(it.openInterest)
       }));
-      arr.sort((a,b)=> a.date.localeCompare(b.date));
+      arr.sort((a, b) => a.date.localeCompare(b.date));
       return arr.slice(-(LOOKBACK_DAYS + 4));
     }
 
-    // OKX: funding rate history (already per funding event)
+    // ---------- OKX providers ----------
     async function fundingDailyOKX(instId) {
       const url = `${OKX}/api/v5/public/funding-rate-history?instId=${instId}&limit=200`;
       const data = await httpJSON(url);
       if (data.code !== '0') throw new Error('OKX funding error ' + JSON.stringify(data));
       const perDay = {};
       (data.data || []).forEach(it => {
-        // OKX fields: fundingRate, fundingTime (ms), or ts
+        // fundingTime (ms) or fallback ts
         const d = it.fundingTime ? toDateYMDms(it.fundingTime) : toDateYMDms(it.ts);
         const r = Number(it.fundingRate);
         if (!perDay[d]) perDay[d] = [];
         perDay[d].push(r);
       });
       const days = Object.keys(perDay).sort();
-      const out = days.map(d => ({ date: d, val: perDay[d].reduce((a,b)=>a+b,0)/perDay[d].length }));
+      const out = days.map(d => ({ date: d, val: perDay[d].reduce((a, b) => a + b, 0) / perDay[d].length }));
       return out.slice(-(LOOKBACK_DAYS + 1));
     }
 
-    // OKX: open interest history (use 8H and take end-of-day)
     async function oiDailyOKX(instId) {
+      // Use 8H granularity and take end-of-day as daily
       const url = `${OKX}/api/v5/public/open-interest-history?instId=${instId}&period=8H&limit=300`;
       const data = await httpJSON(url);
       if (data.code !== '0') throw new Error('OKX OI error ' + JSON.stringify(data));
@@ -98,69 +94,88 @@ export default async function handler(req, res) {
         date: toDateYMDms(it.ts),
         oi: Number(it.oi)
       }));
-      // collapse 8H to one reading per day (use last reading of each day)
       const perDay = {};
-      rows.forEach(r => { perDay[r.date] = r.oi; });
+      rows.forEach(r => { perDay[r.date] = r.oi; }); // last value per day
       const days = Object.keys(perDay).sort();
       const out = days.map(d => ({ date: d, oi: perDay[d] }));
       return out.slice(-(LOOKBACK_DAYS + 4));
     }
 
     function oi3d(oiArr) {
-      return oiArr.map((x,i) => ({
+      return oiArr.map((x, i) => ({
         date: x.date,
-        oi3: i >= 3 ? (oiArr[i].oi / oiArr[i-3].oi - 1) : null
+        oi3: i >= 3 ? (oiArr[i].oi / oiArr[i - 3].oi - 1) : null
       }));
     }
 
-    async function buildOne(coin) {
-      // Try Bybit → fallback to OKX
-      let f = null, o = null;
+    async function metricFundingZ(coin) {
+      // Try Bybit, then OKX
       try {
-        f = await fundingDailyBybit(coin.bybit);
-        o = await oiDailyBybit(coin.bybit);
-      } catch (e) {
-        // Fallback to OKX
-        try {
-          f = await fundingDailyOKX(coin.okx);
-          o = await oiDailyOKX(coin.okx);
-        } catch (e2) {
-          throw new Error('Both providers failed for ' + coin.id);
+        const f = await fundingDailyBybit(coin.bybit);
+        if (f.length >= 11) {
+          const latest = f[f.length - 1].val;
+          const hist = f.slice(0, -1).map(x => x.val);
+          return { z: zScore(hist, latest), days: f.length };
         }
-      }
-      const o3 = oi3d(o);
-      const fd = Object.fromEntries(f.map(x => [x.date, x.val]));
-      const o3d = Object.fromEntries(o3.map(x => [x.date, x.oi3]));
-      const dates = Object.keys(fd).filter(d => d in o3d).sort();
-      if (dates.length < 15) return null;
+      } catch (_) {}
+      try {
+        const f = await fundingDailyOKX(coin.okx);
+        if (f.length >= 11) {
+          const latest = f[f.length - 1].val;
+          const hist = f.slice(0, -1).map(x => x.val);
+          return { z: zScore(hist, latest), days: f.length };
+        }
+      } catch (_) {}
+      return { z: null, days: 0 };
+    }
 
-      const fundingSeries = dates.slice(0, -1).map(d => fd[d]);
-      const fundingLatest = fd[dates[dates.length-1]];
-      const oiSeries = dates.slice(0, -1).map(d => o3d[d]).filter(x => x !== null);
-      const oiLatest = o3d[dates[dates.length-1]];
-
-      const funding_z = zScore(fundingSeries, fundingLatest);
-      const oi_delta_z = (oiLatest === null ? null : zScore(oiSeries, oiLatest));
-
-      return {
-        id: coin.id,
-        funding_z,
-        oi_delta_z,
-        funding_days: fundingSeries.length + 1,
-        oi_days: oiSeries.length + 1
-      };
+    async function metricOIDeltaZ(coin) {
+      // Try Bybit, then OKX
+      try {
+        const o = await oiDailyBybit(coin.bybit);
+        if (o.length >= 14) {
+          const o3 = oi3d(o);
+          const latest = o3[o3.length - 1].oi3;
+          const hist = o3.slice(0, -1).map(x => x.oi3).filter(v => v !== null);
+          return { z: latest === null ? null : zScore(hist, latest), days: hist.length + 1 };
+        }
+      } catch (_) {}
+      try {
+        const o = await oiDailyOKX(coin.okx);
+        if (o.length >= 14) {
+          const o3 = oi3d(o);
+          const latest = o3[o3.length - 1].oi3;
+          const hist = o3.slice(0, -1).map(x => x.oi3).filter(v => v !== null);
+          return { z: latest === null ? null : zScore(hist, latest), days: hist.length + 1 };
+        }
+      } catch (_) {}
+      return { z: null, days: 0 };
     }
 
     const items = [];
     for (const c of COINS) {
-      try {
-        const res1 = await buildOne(c);
-        if (res1) items.push(res1);
-      } catch (e) {
-        // skip this coin
+      const [fz, oz] = await Promise.all([metricFundingZ(c), metricOIDeltaZ(c)]);
+      // Include the coin even if one metric is null (Sheet will ingest whichever exists)
+      if (fz.z !== null || oz.z !== null) {
+        items.push({
+          id: c.id,
+          funding_z: fz.z,
+          oi_delta_z: oz.z,
+          funding_days: fz.days,
+          oi_days: oz.days
+        });
+      } else {
+        // As last resort, still include with nulls so you can see the coin in JSON
+        items.push({
+          id: c.id,
+          funding_z: null,
+          oi_delta_z: null,
+          funding_days: fz.days,
+          oi_days: oz.days
+        });
       }
       // polite backoff between coins
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 150));
     }
 
     const out = {
@@ -171,7 +186,6 @@ export default async function handler(req, res) {
     };
 
     res.setHeader('content-type', 'application/json; charset=utf-8');
-    // Optional caching (5 minutes at the edge)
     res.setHeader('cache-control', 's-maxage=300, stale-while-revalidate=60');
     res.status(200).send(JSON.stringify(out));
   } catch (e) {
