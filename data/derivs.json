@@ -1,1 +1,1 @@
-{"as_of":"2025-08-26T12:49:07Z","lookback_days":90,"source":"bybit","items":[{"id":"bitcoin","funding_z":0.8657880024534617,"oi_delta_z":1.6469149226342177,"funding_days":67,"oi_days":91}]}
+{"as_of":"2025-08-26T18:30:30Z","lookback_days":90,"source":"bybit","items":[{"id":"bitcoin","funding_z":0.8646937406784192,"oi_delta_z":1.6469149226342177,"funding_days":67,"oi_days":91},{"id":"ethereum","funding_z":-2.4994718527193207,"oi_delta_z":-2.1154189321779655,"funding_days":67,"oi_days":91}]}
