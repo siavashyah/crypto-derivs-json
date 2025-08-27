@@ -1,15 +1,15 @@
-name: build-derivs-json
+name: build-metrics-json
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "5 0 * * *"   # daily at 00:05 UTC (adjust as you wish)
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write   # allow commit to repo
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,24 +19,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Build derivs JSON
-        env:
-          BYBIT_BASE: https://bybit-connect.ppromanacc.workers.dev/
-          BYBIT_BASE_FALLBACK: https://r.jina.ai/http://api.bybit.com
+      - name: Install deps
         run: |
-          python scripts/build_derivs_json.py
-          echo "Generated data/derivs.json"
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Build metrics JSON (funding, OI, F&G)
+        run: |
+          python scripts/build_metrics.py
+          echo "Head of data/derivs.json:"
           head -c 300 data/derivs.json || true
           echo ""
 
-      - name: Commit JSON (if changed)
+      - name: Commit JSON and series (if changed)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/derivs.json || true
+          git add data/derivs.json data/oi_series_*.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Update derivs.json"
+            git commit -m "Update metrics (derivs.json + OI series)"
             git push
           fi
