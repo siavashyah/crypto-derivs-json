@@ -1,19 +1,15 @@
 // api/derivs.js
-// Robust derivs endpoint: Funding_z and OI_Delta_z with OKX-first OI,
-// fallbacks to Bybit and r.jina.ai mirrors, last-non-null 3D OI change,
-// and safe debug flag parsing for Vercel Node runtime.
+// Funding_z (Bybit->OKX) and OI_Delta_z (OKX->Bybit->Binance) with fallbacks and debug info.
 
 export default async function handler(req, res) {
   try {
     const LOOKBACK_DAYS = 90;
 
-    // Expand this list as needed
     const COINS = [
-      { id: 'bitcoin',  bybit: 'BTCUSDT',     okx: 'BTC-USDT-SWAP' },
-      { id: 'ethereum', bybit: 'ETHUSDT',     okx: 'ETH-USDT-SWAP' }
+      { id: 'bitcoin',  bybit: 'BTCUSDT',     okx: 'BTC-USDT-SWAP', binance: 'BTCUSDT' },
+      { id: 'ethereum', bybit: 'ETHUSDT',     okx: 'ETH-USDT-SWAP', binance: 'ETHUSDT' }
     ];
 
-    // Multiple bases to bypass occasional CDN blocks
     const BYBIT_BASES = [
       'https://api.bybit.com',
       'https://r.jina.ai/http://api.bybit.com'
@@ -22,8 +18,11 @@ export default async function handler(req, res) {
       'https://www.okx.com',
       'https://r.jina.ai/http://www.okx.com'
     ];
+    const BINANCE_BASES = [
+      'https://fapi.binance.com',
+      'https://r.jina.ai/http://fapi.binance.com'
+    ];
 
-    // Parse debug flag safely (works whether req.query or req.url is present)
     function getDebugFlag(r) {
       try {
         if (r && r.query && (r.query.debug === '1' || r.query.debug === 'true' || r.query.debug === 1 || r.query.debug === true)) {
@@ -43,18 +42,19 @@ export default async function handler(req, res) {
     }
     const debug = getDebugFlag(req);
 
-    // Generic JSON fetch with base fallbacks
     async function httpJSONMulti(bases, pathWithQuery) {
       let lastErr = null;
       for (const base of bases) {
         const url = base.replace(/\/+$/, '') + pathWithQuery;
         try {
           const r = await fetch(url, {
-            headers: { 'user-agent': 'Mozilla/5.0', 'accept': 'application/json' },
+            headers: { 'user-agent': 'curl/8.0', 'accept': 'application/json' },
             cache: 'no-store'
           });
           if (!r.ok) { lastErr = new Error('HTTP ' + r.status + ' ' + url); continue; }
-          return await r.json();
+          // tolerate non-JSON content-type if body is JSON text
+          const text = await r.text();
+          try { return JSON.parse(text); } catch (e) { lastErr = new Error('Parse error ' + url + ' ' + e); continue; }
         } catch (e) {
           lastErr = e;
         }
@@ -91,9 +91,9 @@ export default async function handler(req, res) {
       return { idx: -1, val: null };
     }
 
-    // ---------- Providers with fallbacks ----------
+    // ---------- Providers ----------
 
-    // Bybit funding: 8h -> daily average
+    // Bybit funding (8h -> daily avg)
     async function fundingDailyBybit(symbol) {
       const path = `/v5/market/funding/history?category=linear&symbol=${encodeURIComponent(symbol)}&limit=200`;
       const data = await httpJSONMulti(BYBIT_BASES, path);
@@ -110,7 +110,7 @@ export default async function handler(req, res) {
       return out.slice(-(LOOKBACK_DAYS + 1));
     }
 
-    // OKX funding: events -> daily average
+    // OKX funding (events -> daily avg)
     async function fundingDailyOKX(instId) {
       const path = `/api/v5/public/funding-rate-history?instId=${encodeURIComponent(instId)}&limit=200`;
       const data = await httpJSONMulti(OKX_BASES, path);
@@ -140,7 +140,7 @@ export default async function handler(req, res) {
       return arr.slice(-(LOOKBACK_DAYS + 8));
     }
 
-    // OKX OI history: try 1D then fallback to 8H collapsed to daily
+    // OKX OI history: try 1D then 8H collapsed to daily
     async function oiDailyOKX(instId) {
       try {
         const path1 = `/api/v5/public/open-interest-history?instId=${encodeURIComponent(instId)}&period=1D&limit=200`;
@@ -150,21 +150,33 @@ export default async function handler(req, res) {
           arr.sort((a, b) => a.date.localeCompare(b.date));
           return arr.slice(-(LOOKBACK_DAYS + 8));
         }
-      } catch (_) { /* fallback to 8H below */ }
+      } catch (_) { /* fall through */ }
 
       const path2 = `/api/v5/public/open-interest-history?instId=${encodeURIComponent(instId)}&period=8H&limit=480`;
       const d2 = await httpJSONMulti(OKX_BASES, path2);
       if (d2.code !== '0') throw new Error('OKX OI error ' + JSON.stringify(d2));
-
       const rows = (d2.data || []).map(it => ({ date: toDateYMDms(it.ts), oi: Number(it.oi) }));
       const perDay = {};
-      rows.forEach(r => { perDay[r.date] = r.oi; }); // last of each day
+      rows.forEach(r => { perDay[r.date] = r.oi; });
       const days = Object.keys(perDay).sort();
       const out = days.map(d => ({ date: d, oi: perDay[d] }));
       return out.slice(-(LOOKBACK_DAYS + 8));
     }
 
-    // ---------- Metrics builders (OKX-first for OI) ----------
+    // Binance OI history (daily)
+    async function oiDailyBinance(symbol) {
+      const path = `/futures/data/openInterestHist?symbol=${encodeURIComponent(symbol)}&period=1d&limit=200`;
+      const data = await httpJSONMulti(BINANCE_BASES, path);
+      if (!Array.isArray(data) || data.length === 0) throw new Error('Binance OI error ' + JSON.stringify(data));
+      const arr = data.map(it => ({
+        date: toDateYMDms(it.timestamp),
+        oi: Number(it.sumOpenInterest)
+      }));
+      arr.sort((a, b) => a.date.localeCompare(b.date));
+      return arr.slice(-(LOOKBACK_DAYS + 8));
+    }
+
+    // ---------- Metrics builders ----------
 
     async function metricFundingZ(coin) {
       try {
@@ -187,25 +199,44 @@ export default async function handler(req, res) {
     }
 
     async function metricOIDeltaZ(coin) {
+      const errs = [];
+      // OKX first
       try {
         const o = await oiDailyOKX(coin.okx);
         if (o.length >= 14) {
           const o3 = oi3d(o);
           const last = lastNonNull(o3, 'oi3');
           const hist = last.idx > 0 ? o3.slice(0, last.idx).map(x => x.oi3).filter(v => v !== null) : [];
-          return { z: last.val === null ? null : zScore(hist, last.val), days: hist.length + (last.val !== null ? 1 : 0), provider: 'okx' };
+          return { z: last.val === null ? null : zScore(hist, last.val), days: hist.length + (last.val !== null ? 1 : 0), provider: 'okx', err: null };
         }
-      } catch (_) {}
+        errs.push('okx:no-data');
+      } catch (e1) { errs.push('okx:' + String(e1)); }
+
+      // Bybit second
       try {
         const o = await oiDailyBybit(coin.bybit);
         if (o.length >= 14) {
           const o3 = oi3d(o);
           const last = lastNonNull(o3, 'oi3');
           const hist = last.idx > 0 ? o3.slice(0, last.idx).map(x => x.oi3).filter(v => v !== null) : [];
-          return { z: last.val === null ? null : zScore(hist, last.val), days: hist.length + (last.val !== null ? 1 : 0), provider: 'bybit' };
+          return { z: last.val === null ? null : zScore(hist, last.val), days: hist.length + (last.val !== null ? 1 : 0), provider: 'bybit', err: null };
         }
-      } catch (_) {}
-      return { z: null, days: 0, provider: null };
+        errs.push('bybit:no-data');
+      } catch (e2) { errs.push('bybit:' + String(e2)); }
+
+      // Binance last
+      try {
+        const o = await oiDailyBinance(coin.binance);
+        if (o.length >= 14) {
+          const o3 = oi3d(o);
+          const last = lastNonNull(o3, 'oi3');
+          const hist = last.idx > 0 ? o3.slice(0, last.idx).map(x => x.oi3).filter(v => v !== null) : [];
+          return { z: last.val === null ? null : zScore(hist, last.val), days: hist.length + (last.val !== null ? 1 : 0), provider: 'binance', err: null };
+        }
+        errs.push('binance:no-data');
+      } catch (e3) { errs.push('binance:' + String(e3)); }
+
+      return { z: null, days: 0, provider: null, err: errs.join(' | ') };
     }
 
     const items = [];
@@ -221,9 +252,15 @@ export default async function handler(req, res) {
         oi_days: oz.days
       });
       if (debug) {
-        diag.push({ id: c.id, funding_provider: fz.provider, oi_provider: oz.provider, f_days: fz.days, oi_days: oz.days });
+        diag.push({
+          id: c.id,
+          funding_provider: fz.provider,
+          oi_provider: oz.provider,
+          f_days: fz.days,
+          oi_days: oz.days,
+          oi_err: oz.err || null
+        });
       }
-      // polite backoff
       await new Promise(r => setTimeout(r, 120));
     }
 
