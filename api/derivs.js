@@ -1,18 +1,19 @@
 // api/derivs.js
 // Robust derivs endpoint: Funding_z and OI_Delta_z with OKX-first OI,
-// fallbacks to Bybit and r.jina.ai mirrors, and last-non-null 3D OI change.
+// fallbacks to Bybit and r.jina.ai mirrors, last-non-null 3D OI change,
+// and safe debug flag parsing for Vercel Node runtime.
 
 export default async function handler(req, res) {
   try {
     const LOOKBACK_DAYS = 90;
 
-    // Expand the list later if you wish
+    // Expand this list as needed
     const COINS = [
       { id: 'bitcoin',  bybit: 'BTCUSDT',     okx: 'BTC-USDT-SWAP' },
       { id: 'ethereum', bybit: 'ETHUSDT',     okx: 'ETH-USDT-SWAP' }
     ];
 
-    // Multi-base fallbacks help when a CDN blocks Vercel’s region
+    // Multiple bases to bypass occasional CDN blocks
     const BYBIT_BASES = [
       'https://api.bybit.com',
       'https://r.jina.ai/http://api.bybit.com'
@@ -22,7 +23,27 @@ export default async function handler(req, res) {
       'https://r.jina.ai/http://www.okx.com'
     ];
 
-    // Small helper to try multiple bases for one path+query
+    // Parse debug flag safely (works whether req.query or req.url is present)
+    function getDebugFlag(r) {
+      try {
+        if (r && r.query && (r.query.debug === '1' || r.query.debug === 'true' || r.query.debug === 1 || r.query.debug === true)) {
+          return true;
+        }
+        if (r && typeof r.url === 'string') {
+          const qIndex = r.url.indexOf('?');
+          if (qIndex !== -1) {
+            const qs = r.url.substring(qIndex + 1);
+            const params = new URLSearchParams(qs);
+            const d = params.get('debug');
+            return d === '1' || d === 'true';
+          }
+        }
+      } catch (_) {}
+      return false;
+    }
+    const debug = getDebugFlag(req);
+
+    // Generic JSON fetch with base fallbacks
     async function httpJSONMulti(bases, pathWithQuery) {
       let lastErr = null;
       for (const base of bases) {
@@ -70,7 +91,7 @@ export default async function handler(req, res) {
       return { idx: -1, val: null };
     }
 
-    // ---------- Providers (with multi-base fallbacks) ----------
+    // ---------- Providers with fallbacks ----------
 
     // Bybit funding: 8h -> daily average
     async function fundingDailyBybit(symbol) {
@@ -87,19 +108,6 @@ export default async function handler(req, res) {
       const days = Object.keys(perDay).sort();
       const out = days.map(d => ({ date: d, val: perDay[d].reduce((a, b) => a + b, 0) / perDay[d].length }));
       return out.slice(-(LOOKBACK_DAYS + 1));
-    }
-
-    // Bybit OI: 1d interval
-    async function oiDailyBybit(symbol) {
-      const path = `/v5/market/open-interest?category=linear&symbol=${encodeURIComponent(symbol)}&intervalTime=1d&limit=200`;
-      const data = await httpJSONMulti(BYBIT_BASES, path);
-      if (data.retCode !== 0) throw new Error('Bybit OI error ' + JSON.stringify(data));
-      const arr = (data.result?.list || []).map(it => ({
-        date: toDateYMDms(it.timestamp),
-        oi: Number(it.openInterest)
-      }));
-      arr.sort((a, b) => a.date.localeCompare(b.date));
-      return arr.slice(-(LOOKBACK_DAYS + 8));
     }
 
     // OKX funding: events -> daily average
@@ -119,41 +127,46 @@ export default async function handler(req, res) {
       return out.slice(-(LOOKBACK_DAYS + 1));
     }
 
-    // OKX OI history, try 1D first, then 8H aggregated to daily
+    // Bybit OI (1d)
+    async function oiDailyBybit(symbol) {
+      const path = `/v5/market/open-interest?category=linear&symbol=${encodeURIComponent(symbol)}&intervalTime=1d&limit=200`;
+      const data = await httpJSONMulti(BYBIT_BASES, path);
+      if (data.retCode !== 0) throw new Error('Bybit OI error ' + JSON.stringify(data));
+      const arr = (data.result?.list || []).map(it => ({
+        date: toDateYMDms(it.timestamp),
+        oi: Number(it.openInterest)
+      }));
+      arr.sort((a, b) => a.date.localeCompare(b.date));
+      return arr.slice(-(LOOKBACK_DAYS + 8));
+    }
+
+    // OKX OI history: try 1D then fallback to 8H collapsed to daily
     async function oiDailyOKX(instId) {
-      // 1) Try daily directly
       try {
         const path1 = `/api/v5/public/open-interest-history?instId=${encodeURIComponent(instId)}&period=1D&limit=200`;
         const d1 = await httpJSONMulti(OKX_BASES, path1);
         if (d1.code === '0' && Array.isArray(d1.data) && d1.data.length) {
-          const arr = d1.data.map(it => ({
-            date: toDateYMDms(it.ts),
-            oi: Number(it.oi)
-          }));
+          const arr = d1.data.map(it => ({ date: toDateYMDms(it.ts), oi: Number(it.oi) }));
           arr.sort((a, b) => a.date.localeCompare(b.date));
           return arr.slice(-(LOOKBACK_DAYS + 8));
         }
-      } catch (_) { /* fall through to 8H */ }
+      } catch (_) { /* fallback to 8H below */ }
 
-      // 2) Fallback to 8H -> collapse to daily (last of each day)
       const path2 = `/api/v5/public/open-interest-history?instId=${encodeURIComponent(instId)}&period=8H&limit=480`;
       const d2 = await httpJSONMulti(OKX_BASES, path2);
       if (d2.code !== '0') throw new Error('OKX OI error ' + JSON.stringify(d2));
-      const rows = (d2.data || []).map(it => ({
-        date: toDateYMDms(it.ts),
-        oi: Number(it.oi)
-      }));
+
+      const rows = (d2.data || []).map(it => ({ date: toDateYMDms(it.ts), oi: Number(it.oi) }));
       const perDay = {};
-      rows.forEach(r => { perDay[r.date] = r.oi; });
+      rows.forEach(r => { perDay[r.date] = r.oi; }); // last of each day
       const days = Object.keys(perDay).sort();
       const out = days.map(d => ({ date: d, oi: perDay[d] }));
       return out.slice(-(LOOKBACK_DAYS + 8));
     }
 
-    // ---------- Metrics per coin (OKX-first for OI) ----------
+    // ---------- Metrics builders (OKX-first for OI) ----------
 
     async function metricFundingZ(coin) {
-      // Prefer Bybit for funding; fallback to OKX
       try {
         const f = await fundingDailyBybit(coin.bybit);
         if (f.length >= 11) {
@@ -174,7 +187,6 @@ export default async function handler(req, res) {
     }
 
     async function metricOIDeltaZ(coin) {
-      // Prefer OKX for OI; fallback to Bybit
       try {
         const o = await oiDailyOKX(coin.okx);
         if (o.length >= 14) {
@@ -196,8 +208,6 @@ export default async function handler(req, res) {
       return { z: null, days: 0, provider: null };
     }
 
-    const urlObj = new URL(req.url, 'http://localhost');
-    const debug = urlObj.searchParams.get('debug') === '1';
     const items = [];
     const diag = [];
 
