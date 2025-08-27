@@ -196,7 +196,8 @@ export default async function handler(req, res) {
       return { z: null, days: 0, provider: null };
     }
 
-    const debug = String(new URL(req.url, 'http://x')).searchParams.get('debug') === '1';
+    const urlObj = new URL(req.url, 'http://localhost');
+    const debug = urlObj.searchParams.get('debug') === '1';
     const items = [];
     const diag = [];
 
